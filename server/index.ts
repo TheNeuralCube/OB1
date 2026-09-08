@@ -1,5 +1,19 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
+// HUB MODIFICATIONS (feat/ob1-hub-mods): a deliberate, documented divergence from
+// upstream server/index.ts, kept minimal so it rebases cleanly on every upstream refresh.
+//   B1 capture_thought  accepts optional `source` and `metadata` (merged over the extracted
+//                       metadata) and returns the thought id.
+//   B2 search_thoughts  accepts `filter` (server-side, via match_thoughts) and `count` as an
+//                       alias of `limit`; results print the id and the full metadata JSON.
+//   B3 list_thoughts    accepts `source` and `count`; `topic` matches a string `topic` OR an
+//                       entry of a `topics` array; results print the id and the metadata JSON.
+//   B4 thought_stats    reads every row (paged past the PostgREST cap), counts both topic
+//                       forms, and adds a by-source breakdown.
+//   B5 extractMetadata  keeps the original vocabulary (type incl. decision/personal, `topic`
+//                       string, `tags`) for continuity with an existing corpus.
+// Everything else (search/fetch, auth, transport, upsert_thought dedup) is upstream as-is.
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
@@ -76,12 +90,13 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       messages: [
         {
           role: "system",
+          // B5: original vocabulary, kept for continuity with the existing corpus.
           content: `Extract metadata from the user's captured thought. Return JSON with:
-- "people": array of people mentioned (empty if none)
+- "type": one of "idea", "decision", "reference", "personal", "task", "observation"
+- "topic": a concise topic label (2-5 words)
+- "people": array of people mentioned (empty array if none)
+- "tags": array of 2-5 relevant keyword tags
 - "action_items": array of implied to-dos (empty if none)
-- "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
-- "topics": array of 1-3 short topic tags (always at least one)
-- "type": one of "observation", "task", "idea", "reference", "person_note"
 Only extract what's explicitly there.`,
         },
         { role: "user", content: text },
@@ -92,8 +107,16 @@ Only extract what's explicitly there.`,
   try {
     return JSON.parse(d.choices[0].message.content);
   } catch {
-    return { topics: ["uncategorized"], type: "observation" };
+    return { type: "observation", topic: "uncategorized", people: [], tags: [] };
   }
+}
+
+// B2/B3/B4 helper: a thought's topic labels, whichever form the row uses.
+function topicLabels(m: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  if (typeof m.topic === "string" && m.topic) out.push(m.topic);
+  if (Array.isArray(m.topics)) for (const t of m.topics) if (typeof t === "string") out.push(t);
+  return out;
 }
 
 // --- MCP Server Setup ---
@@ -220,17 +243,22 @@ function buildServer(): McpServer {
       inputSchema: {
         query: z.string().describe("What to search for"),
         limit: z.number().optional().default(10),
+        count: z.number().optional().describe("Alias of limit"),
         threshold: z.number().optional().default(0.5),
+        filter: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe('Optional exact-match filter on top-level metadata keys, e.g. {"project": "x"} or {"type": "decision"}'),
       },
     },
-    async ({ query, limit, threshold }) => {
+    async ({ query, limit, count, threshold, filter }) => {
       try {
         const qEmb = await getEmbedding(query);
         const { data, error } = await supabase.rpc("match_thoughts", {
           query_embedding: qEmb,
           match_threshold: threshold,
-          match_count: limit,
-          filter: {},
+          match_count: count ?? limit,
+          filter: filter ?? {},
         });
 
         if (error) {
@@ -254,16 +282,18 @@ function buildServer(): McpServer {
             const m = t.metadata || {};
             const parts = [
               `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
-              `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+              `ID: ${t.id}`,
+              `Captured: ${t.created_at}`,
               `Type: ${m.type || "unknown"}`,
             ];
-            if (Array.isArray(m.topics) && m.topics.length)
-              parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+            const topics = topicLabels(m);
+            if (topics.length) parts.push(`Topics: ${topics.join(", ")}`);
             if (Array.isArray(m.people) && m.people.length)
               parts.push(`People: ${(m.people as string[]).join(", ")}`);
             if (Array.isArray(m.action_items) && m.action_items.length)
               parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
             parts.push(`\n${t.content}`);
+            parts.push(`\nMetadata: ${JSON.stringify(m)}`);
             return parts.join("\n");
           }
         );
@@ -297,30 +327,41 @@ function buildServer(): McpServer {
       },
       inputSchema: {
         limit: z.number().optional().default(10),
-        type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
-        topic: z.string().optional().describe("Filter by topic tag"),
+        count: z.number().optional().describe("Alias of limit"),
+        type: z.string().optional().describe("Filter by type: idea, decision, reference, personal, task, observation"),
+        topic: z.string().optional().describe("Filter by topic (matches a string `topic` or an entry of a `topics` array)"),
         person: z.string().optional().describe("Filter by person mentioned"),
+        source: z.string().optional().describe("Filter by source, e.g. mcp, claude-code, claude-desktop"),
         days: z.number().optional().describe("Only thoughts from the last N days"),
       },
     },
-    async ({ limit, type, topic, person, days }) => {
+    async ({ limit, count, type, topic, person, source, days }) => {
       try {
-        let q = supabase
-          .from("thoughts")
-          .select("content, metadata, created_at")
-          .order("created_at", { ascending: false })
-          .limit(limit);
+        const buildQuery = (topicForm: "string" | "array" | "none") => {
+          let q = supabase
+            .from("thoughts")
+            .select("id, content, metadata, created_at")
+            .order("created_at", { ascending: false })
+            .limit(count ?? limit);
 
-        if (type) q = q.contains("metadata", { type });
-        if (topic) q = q.contains("metadata", { topics: [topic] });
-        if (person) q = q.contains("metadata", { people: [person] });
-        if (days) {
-          const since = new Date();
-          since.setDate(since.getDate() - days);
-          q = q.gte("created_at", since.toISOString());
+          if (type) q = q.contains("metadata", { type });
+          if (source) q = q.contains("metadata", { source });
+          if (topic && topicForm === "string") q = q.contains("metadata", { topic });
+          if (topic && topicForm === "array") q = q.contains("metadata", { topics: [topic] });
+          if (person) q = q.contains("metadata", { people: [person] });
+          if (days) {
+            const since = new Date();
+            since.setDate(since.getDate() - days);
+            q = q.gte("created_at", since.toISOString());
+          }
+          return q;
+        };
+
+        // B3: a topic filter tries the string form first, then the array form.
+        let { data, error } = await buildQuery(topic ? "string" : "none");
+        if (!error && topic && (!data || !data.length)) {
+          ({ data, error } = await buildQuery("array"));
         }
-
-        const { data, error } = await q;
 
         if (error) {
           return {
@@ -335,12 +376,12 @@ function buildServer(): McpServer {
 
         const results = data.map(
           (
-            t: { content: string; metadata: Record<string, unknown>; created_at: string },
+            t: { id: string; content: string; metadata: Record<string, unknown>; created_at: string },
             i: number
           ) => {
             const m = t.metadata || {};
-            const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-            return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+            const tags = topicLabels(m).join(", ");
+            return `${i + 1}. [${t.created_at}] (${m.type || "??"}${tags ? " - " + tags : ""}) id: ${t.id}\n   ${t.content}\n   Metadata: ${JSON.stringify(m)}`;
           }
         );
 
@@ -378,22 +419,35 @@ function buildServer(): McpServer {
           .from("thoughts")
           .select("*", { count: "exact", head: true });
 
-        const { data } = await supabase
-          .from("thoughts")
-          .select("metadata, created_at")
-          .order("created_at", { ascending: false });
+        // B4: page through every row; PostgREST caps a single select at 1000 rows.
+        type StatRow = { metadata: Record<string, unknown>; created_at: string };
+        const data: StatRow[] = [];
+        const PAGE = 1000;
+        for (let from = 0; ; from += PAGE) {
+          const { data: page, error: pageError } = await supabase
+            .from("thoughts")
+            .select("metadata, created_at")
+            .order("created_at", { ascending: false })
+            .range(from, from + PAGE - 1);
+          if (pageError) throw new Error(pageError.message);
+          if (!page || !page.length) break;
+          data.push(...(page as StatRow[]));
+          if (page.length < PAGE) break;
+        }
 
         const types: Record<string, number> = {};
         const topics: Record<string, number> = {};
         const people: Record<string, number> = {};
+        const sources: Record<string, number> = {};
 
-        for (const r of data || []) {
+        for (const r of data) {
           const m = (r.metadata || {}) as Record<string, unknown>;
           if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
-          if (Array.isArray(m.topics))
-            for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
+          for (const t of topicLabels(m)) topics[t] = (topics[t] || 0) + 1;
           if (Array.isArray(m.people))
             for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
+          const s = (m.source as string) || "unknown";
+          sources[s] = (sources[s] || 0) + 1;
         }
 
         const sort = (o: Record<string, number>): [string, number][] =>
@@ -413,6 +467,9 @@ function buildServer(): McpServer {
           "",
           "Types:",
           ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
+          "",
+          "Sources:",
+          ...sort(sources).map(([k, v]) => `  ${k}: ${v}`),
         ];
 
         if (Object.keys(topics).length) {
@@ -450,18 +507,26 @@ function buildServer(): McpServer {
       },
       inputSchema: {
         content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+        source: z.string().optional().describe('Where this thought is coming from. Default "mcp".'),
+        metadata: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe("Optional additional metadata, merged over the auto-extracted metadata"),
       },
     },
-    async ({ content }) => {
+    async ({ content, source, metadata: extraMetadata }) => {
       try {
-        const [embedding, metadata] = await Promise.all([
+        const [embedding, extracted] = await Promise.all([
           getEmbedding(content),
           extractMetadata(content),
         ]);
 
+        // B1: caller-supplied metadata wins over extracted; source defaults to "mcp".
+        const metadata = { ...extracted, source: source || "mcp", ...(extraMetadata || {}) };
+
         const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
           p_content: content,
-          p_payload: { metadata: { ...metadata, source: "mcp" } },
+          p_payload: { metadata },
         });
 
         if (upsertError) {
@@ -485,9 +550,9 @@ function buildServer(): McpServer {
         }
 
         const meta = metadata as Record<string, unknown>;
-        let confirmation = `Captured as ${meta.type || "thought"}`;
-        if (Array.isArray(meta.topics) && meta.topics.length)
-          confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
+        let confirmation = `Captured as ${meta.type || "thought"} | id: ${thoughtId}`;
+        const capturedTopics = topicLabels(meta);
+        if (capturedTopics.length) confirmation += ` — ${capturedTopics.join(", ")}`;
         if (Array.isArray(meta.people) && meta.people.length)
           confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
         if (Array.isArray(meta.action_items) && meta.action_items.length)
