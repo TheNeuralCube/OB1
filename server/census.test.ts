@@ -33,7 +33,7 @@ Deno.test("core census: auth, tool discovery, RPC arguments, results and errors"
       rpcCalls++;
       calls.push(JSON.parse(String(init?.body)));
       if (responseMode === "error") return Response.json({ message: "Artificial RPC rejection", code: "22023" }, { status: 400 });
-      return Response.json({ key: "sensitivity", filter: {}, total: 1501, groups: { internal: 1500, "(none)": 1 } });
+      return Response.json({ key: "sensitivity", filter: {}, total: 1501, missing: 1, groups: { internal: 1500, "(none)": 1 } });
     };
     await import("./index.ts");
     let id = 0;
@@ -58,6 +58,7 @@ Deno.test("core census: auth, tool discovery, RPC arguments, results and errors"
     assertEquals(list.result.tools.find((t: {name: string}) => t.name === "thought_census").annotations.readOnlyHint, true);
     const ok = await rpc("tools/call", { name: "thought_census", arguments: { key: "sensitivity" } });
     assertEquals(JSON.parse(ok.result.content[0].text).total, 1501);
+    assertEquals(JSON.parse(ok.result.content[0].text).missing, 1);
     assertEquals(calls[0], { p_key: "sensitivity", p_filter: {} });
     await rpc("tools/call", { name: "thought_census", arguments: { key: "x'; SELECT 1; --", filter: { nested: { a: 1 } } } });
     assertEquals(calls[1], { p_key: "x'; SELECT 1; --", p_filter: { nested: { a: 1 } } });

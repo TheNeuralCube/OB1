@@ -409,7 +409,7 @@ function buildServer(): McpServer {
     {
       title: "Thought Census",
       description:
-        "Count all thoughts grouped by a metadata key, optionally restricted by JSON metadata containment. Missing or null values share the (none) group. Returns key, filter, total and groups; no thought content.",
+        "Count all thoughts grouped by a metadata key, optionally restricted by JSON metadata containment. Missing or null values share the (none) display group; missing counts them separately from literal values. Returns key, filter, total, missing and groups; no thought content.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         key: z.string().min(1).describe("Literal metadata key, for example project or sensitivity"),

@@ -22,14 +22,15 @@ DO $$ DECLARE a public.thought_audit; BEGIN
   ASSERT a.actor_context = '{"origin":"trigger"}'::jsonb;
   ASSERT a.diff->>'content' = 'Artificial guarded record';
   ASSERT NOT (a.diff ? 'embedding');
-  ASSERT (SELECT count(*) FROM jsonb_object_keys(a.diff)) = 6;
-  ASSERT a.diff ?& ARRAY['id','content','metadata','content_fingerprint','created_at','updated_at'];
+  ASSERT (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(a.diff) k) =
+    (SELECT array_agg(attname::text ORDER BY attname::text) FROM pg_catalog.pg_attribute
+     WHERE attrelid='public.thoughts'::regclass AND attnum>0 AND NOT attisdropped AND attname<>'embedding');
 END; $$;
 
 -- Role enforcement, including inherited default audit-table grants.
 DO $$ BEGIN
-  ASSERT NOT has_table_privilege('anon','public.thoughts','UPDATE');
-  ASSERT NOT has_table_privilege('anon','public.thoughts','TRUNCATE');
+  ASSERT NOT EXISTS (SELECT FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE',
+    'TRUNCATE','REFERENCES','TRIGGER','MAINTAIN']) p WHERE has_table_privilege('anon','public.thoughts',p));
   ASSERT NOT has_table_privilege('service_role','public.thought_audit','UPDATE');
   ASSERT NOT has_table_privilege('service_role','public.thought_audit','DELETE');
   ASSERT NOT has_table_privilege('service_role','public.thought_audit','TRUNCATE');
@@ -160,16 +161,44 @@ DO $$ DECLARE c jsonb; BEGIN
   ASSERT (c->>'total')::integer=1211;
   ASSERT (c->'groups'->>'internal')::integer=1205;
   ASSERT (c->'groups'->>'(none)')::integer=6;
+  ASSERT (c->>'missing')::integer=6;
   c:=public.thought_census('supersedes','{"suite":"census"}');
   ASSERT (SELECT count(*) FROM jsonb_object_keys(c->'groups'))=1211;
   c:=public.thought_census('x''; SELECT 1; --','{"suite":"census"}');
   ASSERT (c->'groups'->>'(none)')::integer=1211;
   c:=public.thought_census('project','{"suite":"absent"}');
   ASSERT c->'groups'='{}'::jsonb AND (c->>'total')::integer=0;
+  ASSERT (c->>'missing')::integer=0;
   BEGIN
     PERFORM public.thought_census('key','null');
     RAISE EXCEPTION USING ERRCODE='ZX001', MESSAGE='Null filter accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END; $$;
+RESET ROLE;
+-- SQL NULL joins the empty-filter population. Display collisions are not missing.
+INSERT INTO public.thoughts(content,metadata) VALUES
+  ('Artificial SQL-null metadata',NULL),
+  ('Artificial absent census key','{"suite":"collisions"}'),
+  ('Artificial JSON-null census key','{"suite":"collisions","collision":null}'),
+  ('Artificial literal none','{"suite":"collisions","collision":"(none)"}'),
+  ('Artificial number','{"suite":"collisions","collision":1}'),
+  ('Artificial numeric string','{"suite":"collisions","collision":"1"}'),
+  ('Artificial boolean','{"suite":"collisions","collision":true}'),
+  ('Artificial boolean string','{"suite":"collisions","collision":"true"}');
+SET LOCAL ROLE service_role;
+DO $$ DECLARE c jsonb; expected_groups jsonb; BEGIN
+  c:=public.thought_census('collision');
+  ASSERT (c->>'total')::bigint=(SELECT count(*) FROM public.thoughts);
+  ASSERT (c->>'missing')::bigint=(SELECT count(*) FROM public.thoughts WHERE metadata->>'collision' IS NULL);
+  SELECT jsonb_object_agg(bucket,n) INTO expected_groups FROM (
+    SELECT coalesce(metadata->>'collision','(none)') bucket,count(*) n FROM public.thoughts GROUP BY 1
+  ) independent_counts;
+  ASSERT c->'groups'=expected_groups;
+  ASSERT (c->'groups'->>'(none)')::bigint=(c->>'missing')::bigint+1;
+  c:=public.thought_census('collision','{"suite":"collisions"}');
+  ASSERT c->'groups'='{"(none)":3,"1":2,"true":2}'::jsonb;
+  ASSERT (c->>'total')::integer=7 AND (c->>'missing')::integer=2;
+  ASSERT NOT EXISTS (SELECT FROM public.thoughts WHERE metadata IS NULL AND coalesce(metadata,'{}'::jsonb) @> '{"suite":"collisions"}'::jsonb);
 END; $$;
 RESET ROLE;
 -- Temporarily grant execute for this test only: invoker must still obey RLS.

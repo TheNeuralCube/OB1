@@ -33,9 +33,14 @@ Scott Hutchinson's [Thought Audit schema](../thought-audit/README.md). More prac
 1. Read current grants, triggers, function definitions, row counts and source versions. Save them
    privately for rollback. An already deployed update endpoint is callable by any shared-key holder;
    omitting it from a connector list does not disable it. Coordinate the cutover with those writers.
-2. Assemble **one transactional migration** in a private deployment workspace: begin transaction,
+2. Assemble **one transactional migration** in a private deployment workspace: have the runner begin a transaction,
    set the local search path to `public`, set a short lock timeout, lock `public.thoughts` against
-   concurrent writes, include the pinned audit schema unchanged, include this `schema.sql`, commit.
+   concurrent writes, assert the reviewed table/column ACL, grantors, grant options and role memberships,
+   include the pinned audit schema unchanged, include this `schema.sql`, insert the migration history
+   record, and commit. Use an explicitly verified runner, such as `psql --single-transaction` covering
+   both the payload and history insert. Do not embed transaction control in the migration payload.
+   Assert the executor is the recorded owner/grantor; abort on permission drift. After revocation,
+   check effective anon access for all eight table privileges, including inherited and PUBLIC access.
    Both SQL files must run in the same transaction. Preserve the existing updated-at function and
    trigger rather than recreating or replacing them. This layer checks the enabled-trigger prerequisite.
 3. Test the bundle on an empty disposable database first. `tests.sql` requires artificial empty
@@ -64,14 +69,17 @@ Scott Hutchinson's [Thought Audit schema](../thought-audit/README.md). More prac
 `thought_census({key: "sensitivity", filter: {project: "example"}})` returns a JSON value:
 
 ```json
-{"key":"sensitivity","filter":{"project":"example"},"total":3,"groups":{"internal":2,"(none)":1}}
+{"key":"sensitivity","filter":{"project":"example"},"total":3,"missing":1,"groups":{"internal":2,"(none)":1}}
 ```
 
 This is SQL aggregation across the selected population, without a REST row limit. The key is a
 text value, never executable SQL. Filters use JSONB containment (include-only, including nested
-objects); SQL-null metadata is excluded by containment. Missing and JSON-null key values share
-`(none)`. A literal metadata value `(none)` shares that bucket too. Values of other JSON types use
-PostgreSQL's text representation. Results represent the calling statement's snapshot, not a frozen
+objects); SQL-null metadata is treated as an empty object, included by an empty filter and excluded
+by nonempty filters. The separate `missing` count includes SQL-null metadata, absent keys and JSON-null
+values within that population. They share the `(none)` display bucket with the literal string `(none)`,
+but that literal does not increment `missing`. Other JSON types use PostgreSQL's text representation:
+the number `1` and string `"1"` share a group, as do boolean `true` and string `"true"`.
+Use `missing` for coverage counts. Results represent the calling statement's snapshot, not a frozen
 population across multiple tool calls. High-cardinality keys can produce large JSON responses.
 
 Audit records copy `to_jsonb(OLD) - 'embedding'` before UPDATE or DELETE. Audit failure aborts the
@@ -120,6 +128,13 @@ Notify PostgREST to reload its schema after function changes. Re-read counts and
   overwritten. The database downgrade guard uses the real OLD row, but it is not compare-and-swap.
 - Stock content updates do not refresh `content_fingerprint`. Review dedup consequences separately;
   this bundle does not change the pinned update integration or repair existing records.
+- BEFORE row triggers fire by name: `thoughts_audit_before_change`, then
+  `thoughts_sensitivity_before_update`, then `thoughts_updated_at`. A rejected guard rolls back its
+  audit insert. Review future trigger additions: an earlier trigger returning NULL can skip the row
+  before auditing. Audit serializes the entire OLD row before removing embedding; this still pays
+  vector serialization cost. Verify a vector-bearing row and measure one update before bulk work.
+  Derive expected audit keys from actual non-dropped table columns excluding embedding; do not
+  assume a fixture's column count. Audit protects ordinary UPDATE/DELETE, not privileged truncation.
 - Existing `authenticated` grants on thoughts are unchanged by the ruled anon-only revocation.
   Table owners can disable triggers; privileged maintenance is outside the ordinary-write guarantee.
 - Upstream audit comments originally describe best-effort application logging. This layer overrides

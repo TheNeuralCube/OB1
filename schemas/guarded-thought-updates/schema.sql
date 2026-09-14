@@ -107,11 +107,13 @@ BEGIN
   SELECT jsonb_build_object(
     'key', p_key, 'filter', p_filter,
     'total', coalesce(sum(n), 0),
+    'missing', coalesce(sum(missing_n), 0),
     'groups', coalesce(jsonb_object_agg(bucket, n), '{}'::jsonb)
   ) INTO result FROM (
-    SELECT coalesce(metadata ->> p_key, '(none)') AS bucket, count(*) AS n
+    SELECT coalesce(metadata ->> p_key, '(none)') AS bucket, count(*) AS n,
+      count(*) FILTER (WHERE metadata ->> p_key IS NULL) AS missing_n
     FROM public.thoughts
-    WHERE metadata @> p_filter
+    WHERE coalesce(metadata, '{}'::jsonb) @> p_filter
     GROUP BY coalesce(metadata ->> p_key, '(none)')
   ) counts;
   RETURN result;
