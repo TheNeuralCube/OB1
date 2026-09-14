@@ -12,6 +12,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 //                       forms, and adds a by-source breakdown.
 //   B5 extractMetadata  keeps the original vocabulary (type incl. decision/personal, `topic`
 //                       string, `tags`) for continuity with an existing corpus.
+//   B6 thought_census  counts metadata groups in SQL, including the missing-key bucket.
 // Everything else (search/fetch, auth, transport, upsert_thought dedup) is upstream as-is.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -398,6 +399,35 @@ function buildServer(): McpServer {
           content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
           isError: true,
         };
+      }
+    }
+  );
+
+  // Exact population counts, independent of semantic recall and REST row caps.
+  server.registerTool(
+    "thought_census",
+    {
+      title: "Thought Census",
+      description:
+        "Count all thoughts grouped by a metadata key, optionally restricted by JSON metadata containment. Missing or null values share the (none) group. Returns key, filter, total and groups; no thought content.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        key: z.string().min(1).describe("Literal metadata key, for example project or sensitivity"),
+        filter: z.record(z.string(), z.unknown()).optional().describe("Include only metadata containing this JSON object"),
+      },
+    },
+    async ({ key, filter }) => {
+      try {
+        const { data, error } = await supabase.rpc("thought_census", {
+          p_key: key,
+          p_filter: filter ?? {},
+        });
+        if (error) {
+          return { content: [{ type: "text" as const, text: `thought_census error: ${error.message}` }], isError: true };
+        }
+        return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
       }
     }
   );
