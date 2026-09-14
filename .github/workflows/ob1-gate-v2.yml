@@ -13,7 +13,7 @@ name: OB1 PR Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
-    branches: [main]
+    branches: [main, 'feat/ob1-ci-policy']
   workflow_dispatch:
 
 # Fork code is inspected only in the unprivileged PR event. Never opt into
@@ -298,7 +298,7 @@ jobs:
                 rule5_detail="${rule5_detail}  - \`$f\`: contains DROP/TRUNCATE statement\n"
                 rule5_pass=false
               fi
-  
+
               # Check for DELETE without WHERE
               deletes=$(grep -niE 'DELETE\s+FROM' "$f" 2>/dev/null || true)
               if [ -n "$deletes" ]; then
@@ -309,7 +309,7 @@ jobs:
                   fi
                 done <<< "$deletes"
               fi
-  
+
               # Check for altering/dropping core thoughts table columns
               alter_thoughts=$(grep -niE 'ALTER\s+TABLE\s+thoughts\s+(DROP|ALTER)\s+COLUMN' "$f" 2>/dev/null || true)
               if [ -n "$alter_thoughts" ]; then
