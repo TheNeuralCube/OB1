@@ -13,7 +13,7 @@ name: OB1 PR Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
-    branches: [main]
+    branches: [main, 'feat/ob1-ci-policy']
   workflow_dispatch:
 
 # Fork code is inspected only in the unprivileged PR event. Never opt into
@@ -51,6 +51,31 @@ jobs:
           git cat-file -e "$BASE_SHA^{commit}"
           git show "$BASE_SHA:.github/metadata.schema.json" > /tmp/ob1-metadata.schema.json
 
+      - name: Load reviewed fork policy from exact base
+        id: fork_policy
+        if: github.repository == 'TheNeuralCube/OB1'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          echo 'helper_identity={}' >> "$GITHUB_OUTPUT"
+          echo 'ready=false' >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/ob1-fork-policy
+          policy_ready=true
+          for name in sql_safety.py test_sql_safety.py fork_scope.py test_fork_scope.py; do
+            if ! git cat-file -e "$BASE_SHA:.github/scripts/$name"; then policy_ready=false; fi
+          done
+          if [ "$policy_ready" = false ]; then
+            echo 'Fork adaptation inactive until reviewed helpers exist in base; original rules apply.'
+            exit 0
+          fi
+          for name in sql_safety.py test_sql_safety.py fork_scope.py test_fork_scope.py; do
+            git show "$BASE_SHA:.github/scripts/$name" > "/tmp/ob1-fork-policy/$name"
+          done
+          python3 -B -m unittest discover -s /tmp/ob1-fork-policy -p 'test_*.py'
+          helper_identity=$(python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("/tmp/ob1-fork-policy"); print(json.dumps({f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(p.glob("*.py"))},separators=(",",":")))')
+          echo "helper_identity=$helper_identity" >> "$GITHUB_OUTPUT"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
       - name: Test gate security helpers when present
         run: |
           if [ -f .github/scripts/gate-context.test.cjs ]; then
@@ -79,12 +104,29 @@ jobs:
           echo "$contrib_dirs" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Test exact owned policy PR candidate (unprivileged, not enforcement)
+        id: policy_candidate
+        if: github.repository == 'TheNeuralCube/OB1' && github.event.pull_request.head.repo.full_name == 'TheNeuralCube/OB1'
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          echo 'tested=false' >> "$GITHUB_OUTPUT"
+          if ! python3 -c 'import os,sys; expected={".github/workflows/ob1-gate-v2.yml", *{".github/scripts/"+n for n in ("sql_safety.py","test_sql_safety.py","fork_scope.py","test_fork_scope.py")}}; sys.exit(set(os.environ["CHANGED_FILES"].splitlines()) != expected)'; then
+            exit 0
+          fi
+          python3 -B -m unittest discover -s .github/scripts -p 'test_sql_safety.py'
+          python3 -B -m unittest discover -s .github/scripts -p 'test_fork_scope.py'
+          echo 'tested=true' >> "$GITHUB_OUTPUT"
+
       - name: Run review checks
         id: review
         env:
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
           CONTRIB_DIRS: ${{ steps.changed.outputs.contrib_dirs }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          POLICY_CANDIDATE_TESTED: ${{ steps.policy_candidate.outputs.tested }}
         run: |
           pass_count=0
           fail_count=0
@@ -101,6 +143,16 @@ jobs:
             fail_count=$((fail_count + 1))
           }
 
+          # Exact fork-owned six-file guard/census bundle, checked by BASE policy.
+          fork_bundle=false
+          if [ "$GITHUB_REPOSITORY" = TheNeuralCube/OB1 ] && [ -f /tmp/ob1-fork-policy/fork_scope.py ] && python3 /tmp/ob1-fork-policy/fork_scope.py; then
+            fork_bundle=true
+          fi
+
+          policy_candidate="${POLICY_CANDIDATE_TESTED:-false}"
+          echo "fork_bundle=$fork_bundle" >> "$GITHUB_OUTPUT"
+          echo "policy_candidate=$policy_candidate" >> "$GITHUB_OUTPUT"
+
           # Skip contribution checks for docs/governance PRs.
           # Detected by PR title prefix OR by no contribution dirs being touched.
           is_docs_pr=false
@@ -110,7 +162,7 @@ jobs:
             is_docs_pr=true
           fi
 
-          if [ "$is_docs_pr" = true ]; then
+          if [ "$is_docs_pr" = true ] && [ "$fork_bundle" = false ] && [ "$policy_candidate" = false ]; then
             results="This PR modifies docs or repo governance files. Contribution checks skipped.\n\n✅ No issues found."
             echo "comment<<EOF" >> $GITHUB_OUTPUT
             echo -e "## OB1 PR Gate\n\n${results}" >> $GITHUB_OUTPUT
@@ -125,14 +177,18 @@ jobs:
           allowed_pattern='^(recipes|schemas|dashboards|integrations|skills|primitives|extensions|docs|resources|\.github|\.gitkeep|\.gitignore|\.markdownlint)'
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            if ! echo "$f" | grep -qE "$allowed_pattern"; then
+            if [ "$fork_bundle" = false ] && ! echo "$f" | grep -qE "$allowed_pattern"; then
               bad_files="${bad_files}  - \`$f\`\n"
               rule1_pass=false
             fi
           done <<< "$CHANGED_FILES"
 
           if [ "$rule1_pass" = true ]; then
-            pass_check "Folder structure" "All files are in allowed directories"
+            if [ "$fork_bundle" = true ]; then
+              pass_check "Folder structure" "Exact six-path fork bundle exception applied by base fork_scope.py"
+            else
+              pass_check "Folder structure" "All files are in allowed directories (original rule)"
+            fi
           else
             fail_check "Folder structure" "Files outside allowed directories:\n${bad_files}"
           fi
@@ -230,34 +286,45 @@ jobs:
             [ ! -f "$f" ] && continue
             case "$f" in *.sql) ;; *) continue ;; esac
 
-            # Check for destructive operations
-            dangerous=$(grep -niE '(DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE)' "$f" 2>/dev/null || true)
-            if [ -n "$dangerous" ]; then
-              rule5_detail="${rule5_detail}  - \`$f\`: contains DROP/TRUNCATE statement\n"
-              rule5_pass=false
-            fi
+            if [ "$fork_bundle" = true ]; then
+              if ! sql_issues=$(python3 /tmp/ob1-fork-policy/sql_safety.py "$f"); then
+                rule5_detail="${rule5_detail}  - \`$f\`: ${sql_issues}\n"
+                rule5_pass=false
+              fi
+            else
+              # Check for destructive operations
+              dangerous=$(grep -niE '(DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE)' "$f" 2>/dev/null || true)
+              if [ -n "$dangerous" ]; then
+                rule5_detail="${rule5_detail}  - \`$f\`: contains DROP/TRUNCATE statement\n"
+                rule5_pass=false
+              fi
 
-            # Check for DELETE without WHERE
-            deletes=$(grep -niE 'DELETE\s+FROM' "$f" 2>/dev/null || true)
-            if [ -n "$deletes" ]; then
-              while IFS= read -r line; do
-                if ! echo "$line" | grep -qiE 'WHERE'; then
-                  rule5_detail="${rule5_detail}  - \`$f\` line $(echo "$line" | cut -d: -f1): DELETE FROM without WHERE clause\n"
-                  rule5_pass=false
-                fi
-              done <<< "$deletes"
-            fi
+              # Check for DELETE without WHERE
+              deletes=$(grep -niE 'DELETE\s+FROM' "$f" 2>/dev/null || true)
+              if [ -n "$deletes" ]; then
+                while IFS= read -r line; do
+                  if ! echo "$line" | grep -qiE 'WHERE'; then
+                    rule5_detail="${rule5_detail}  - \`$f\` line $(echo "$line" | cut -d: -f1): DELETE FROM without WHERE clause\n"
+                    rule5_pass=false
+                  fi
+                done <<< "$deletes"
+              fi
 
-            # Check for altering/dropping core thoughts table columns
-            alter_thoughts=$(grep -niE 'ALTER\s+TABLE\s+thoughts\s+(DROP|ALTER)\s+COLUMN' "$f" 2>/dev/null || true)
-            if [ -n "$alter_thoughts" ]; then
-              rule5_detail="${rule5_detail}  - \`$f\`: modifies core thoughts table columns (only ADD COLUMN is allowed)\n"
-              rule5_pass=false
+              # Check for altering/dropping core thoughts table columns
+              alter_thoughts=$(grep -niE 'ALTER\s+TABLE\s+thoughts\s+(DROP|ALTER)\s+COLUMN' "$f" 2>/dev/null || true)
+              if [ -n "$alter_thoughts" ]; then
+                rule5_detail="${rule5_detail}  - \`$f\`: modifies core thoughts table columns (only ADD COLUMN is allowed)\n"
+                rule5_pass=false
+              fi
             fi
           done <<< "$CHANGED_FILES"
 
           if [ "$rule5_pass" = true ]; then
-            pass_check "SQL safety" "No destructive SQL or core table modifications"
+            if [ "$fork_bundle" = true ]; then
+              pass_check "SQL safety" "Base-pinned conservative SQL policy passed for exact fork bundle"
+            else
+              pass_check "SQL safety" "Original SQL checks passed"
+            fi
           else
             fail_check "SQL safety" "SQL safety issues:\n${rule5_detail}"
           fi
@@ -341,7 +408,13 @@ jobs:
           fi
 
           # ─── Rule 7: PR format ───
-          if echo "$PR_TITLE" | grep -qE '^\[(recipes|schemas|dashboards|integrations|skills|primitives|extensions|docs)\] '; then
+          if [ "$policy_candidate" = true ]; then
+            if [ "$PR_TITLE" = '[docs] Review fork guard and census policy' ]; then
+              pass_check "PR format" "Exact reviewed policy title; all review rules evaluated"
+            else
+              fail_check "PR format" "Exact policy candidate requires title: [docs] Review fork guard and census policy"
+            fi
+          elif echo "$PR_TITLE" | grep -qE '^\[(recipes|schemas|dashboards|integrations|skills|primitives|extensions|docs)\] '; then
             pass_check "PR format" "Title follows \`[category] Description\` format"
           else
             fail_check "PR format" "PR title must start with \`[recipes]\`, \`[schemas]\`, \`[dashboards]\`, \`[integrations]\`, \`[skills]\`, \`[primitives]\`, \`[extensions]\`, or \`[docs]\` followed by a space and description"
@@ -533,7 +606,8 @@ jobs:
           out_of_scope=""
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            in_scope=false
+            in_scope="$fork_bundle"
+            if [ "$policy_candidate" = true ]; then in_scope=true; fi
             while IFS= read -r dir; do
               [ -z "$dir" ] && continue
               if echo "$f" | grep -qE "^${dir}/"; then
@@ -548,7 +622,13 @@ jobs:
           done <<< "$CHANGED_FILES"
 
           if [ "$rule12_pass" = true ]; then
-            pass_check "Scope check" "All changes are within the contribution folder(s)"
+            if [ "$fork_bundle" = true ]; then
+              pass_check "Scope check" "Exact six-path fork bundle exception applied by base fork_scope.py"
+            elif [ "$policy_candidate" = true ]; then
+              pass_check "Scope check" "Exact owned five-path policy candidate; unprivileged tests passed; base enforcement is separate"
+            else
+              pass_check "Scope check" "All changes are within contribution folders (original rule)"
+            fi
           else
             fail_check "Scope check" "Files changed outside contribution folder(s):\n${out_of_scope}Contribution PRs should only modify files in their own folder."
           fi
@@ -630,6 +710,9 @@ jobs:
 
           # ─── Build summary ───
           total=$((pass_count + fail_count))
+          echo "checks_evaluated=$total" >> "$GITHUB_OUTPUT"
+          echo "checks_passed=$pass_count" >> "$GITHUB_OUTPUT"
+          echo "checks_failed=$fail_count" >> "$GITHUB_OUTPUT"
           if [ "$fail_count" -gt 0 ]; then
             summary="**Result: ${pass_count}/${total} checks passed. Please fix the issues above and push again.**"
             echo "failed=true" >> $GITHUB_OUTPUT
@@ -654,6 +737,14 @@ jobs:
       - name: Write gate artifact
         env:
           REVIEW_COMMENT: ${{ steps.review.outputs.comment }}
+          FORK_BUNDLE: ${{ steps.review.outputs.fork_bundle }}
+          CHECKS_EVALUATED: ${{ steps.review.outputs.checks_evaluated || '0' }}
+          CHECKS_PASSED: ${{ steps.review.outputs.checks_passed || '0' }}
+          CHECKS_FAILED: ${{ steps.review.outputs.checks_failed || '0' }}
+          POLICY_CANDIDATE: ${{ steps.review.outputs.policy_candidate }}
+          POLICY_READY: ${{ steps.fork_policy.outputs.ready }}
+          POLICY_HELPERS: ${{ steps.fork_policy.outputs.helper_identity || '{}' }}
+          POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REVIEW_FAILED: ${{ steps.review.outputs.failed }}
           SECRET_BLOCKED: ${{ steps.review.outputs.secret_blocked }}
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
@@ -661,6 +752,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          POLICY_CANDIDATE_TESTED: ${{ steps.policy_candidate.outputs.tested }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
           PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
@@ -685,6 +779,17 @@ jobs:
             --arg is_draft "$PR_DRAFT" \
             --arg failed "$REVIEW_FAILED" \
             --arg secret_blocked "$SECRET_BLOCKED" \
+            --argjson checks_evaluated "$CHECKS_EVALUATED" \
+            --argjson checks_passed "$CHECKS_PASSED" \
+            --argjson checks_failed "$CHECKS_FAILED" \
+            --arg fork_bundle "$FORK_BUNDLE" \
+            --arg policy_candidate "$POLICY_CANDIDATE" \
+            --arg policy_ready "$POLICY_READY" \
+            --arg head_repository "$PR_HEAD_REPOSITORY" \
+            --arg head_ref "$PR_HEAD_REF" \
+            --arg base_sha "$POLICY_BASE_SHA" \
+            --argjson policy_helpers "$POLICY_HELPERS" \
+            --arg changed_files "$CHANGED_FILES" \
             '{
               pr_number: $pr_number,
               pr_url: $pr_url,
@@ -694,7 +799,20 @@ jobs:
               author_association: $author_association,
               is_draft: ($is_draft == "true"),
               failed: ($failed == "true"),
-              secret_blocked: ($secret_blocked == "true")
+              secret_blocked: ($secret_blocked == "true"),
+              fork_bundle: ($fork_bundle == "true"),
+              checks_evaluated: $checks_evaluated,
+              checks_passed: $checks_passed,
+              checks_failed: $checks_failed,
+              policy_candidate_tested: ($policy_candidate == "true"),
+              policy_exception: (if $fork_bundle == "true" then "guard-census-six-paths" elif $policy_candidate == "true" then "policy-candidate-five-paths" else null end),
+              exception_files: (if $fork_bundle == "true" or $policy_candidate == "true" then ($changed_files | split("\n") | map(select(length > 0))) else [] end),
+              head_repository: $head_repository,
+              head_ref: $head_ref,
+              base_sha: $base_sha,
+              base_policy_ready: ($policy_ready == "true"),
+              enforcing_helpers_sha256: (if $fork_bundle == "true" then $policy_helpers else {} end),
+              driver_trust: "PR-head-supplied; exact-head review required"
             }' > gate-artifact/ob1-review-context.json
 
       - name: Upload gate artifact
