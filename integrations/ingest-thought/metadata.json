@@ -3,8 +3,8 @@
   "description": "Retired unauthenticated capture endpoint; returns HTTP 410 without accepting writes.",
   "category": "integrations",
   "author": {
-    "name": "OB1 maintainers",
-    "github": "NateBJones-Projects"
+    "name": "The Neural Cube",
+    "github": "TheNeuralCube"
   },
   "version": "1.0.0",
   "requires": {
