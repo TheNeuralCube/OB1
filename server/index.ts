@@ -12,7 +12,12 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 //                       forms, and adds a by-source breakdown.
 //   B5 extractMetadata  keeps the original vocabulary (type incl. decision/personal, `topic`
 //                       string, `tags`) for continuity with an existing corpus.
+//   B6 thought_census  counts metadata groups in SQL, including the missing-key bucket.
 // Everything else (search/fetch, auth, transport, upsert_thought dedup) is upstream as-is.
+
+import { extractMetadata } from "./metadata.ts";
+
+import { safeEqual } from "./safe-equal.ts";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
@@ -75,40 +80,6 @@ async function getEmbedding(text: string): Promise<number[]> {
   }
   const d = await r.json();
   return d.data[0].embedding;
-}
-
-async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          // B5: original vocabulary, kept for continuity with the existing corpus.
-          content: `Extract metadata from the user's captured thought. Return JSON with:
-- "type": one of "idea", "decision", "reference", "personal", "task", "observation"
-- "topic": a concise topic label (2-5 words)
-- "people": array of people mentioned (empty array if none)
-- "tags": array of 2-5 relevant keyword tags
-- "action_items": array of implied to-dos (empty if none)
-Only extract what's explicitly there.`,
-        },
-        { role: "user", content: text },
-      ],
-    }),
-  });
-  const d = await r.json();
-  try {
-    return JSON.parse(d.choices[0].message.content);
-  } catch {
-    return { type: "observation", topic: "uncategorized", people: [], tags: [] };
-  }
 }
 
 // B2/B3/B4 helper: a thought's topic labels, whichever form the row uses.
@@ -402,6 +373,35 @@ function buildServer(): McpServer {
     }
   );
 
+  // Exact population counts, independent of semantic recall and REST row caps.
+  server.registerTool(
+    "thought_census",
+    {
+      title: "Thought Census",
+      description:
+        "Count all thoughts grouped by a metadata key, optionally restricted by JSON metadata containment. Missing or null values share the (none) display group; missing counts them separately from literal values. Returns key, filter, total, missing and groups; no thought content.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        key: z.string().min(1).describe("Literal metadata key, for example project or sensitivity"),
+        filter: z.record(z.string(), z.unknown()).optional().describe("Include only metadata containing this JSON object"),
+      },
+    },
+    async ({ key, filter }) => {
+      try {
+        const { data, error } = await supabase.rpc("thought_census", {
+          p_key: key,
+          p_filter: filter ?? {},
+        });
+        if (error) {
+          return { content: [{ type: "text" as const, text: `thought_census error: ${error.message}` }], isError: true };
+        }
+        return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+      }
+    }
+  );
+
   // Tool 3: Stats
   server.registerTool(
     "thought_stats",
@@ -518,11 +518,16 @@ function buildServer(): McpServer {
       try {
         const [embedding, extracted] = await Promise.all([
           getEmbedding(content),
-          extractMetadata(content),
+          extractMetadata(content, OPENROUTER_API_KEY),
         ]);
 
-        // B1: caller-supplied metadata wins over extracted; source defaults to "mcp".
-        const metadata = { ...extracted, source: source || "mcp", ...(extraMetadata || {}) };
+        // B1: caller-supplied metadata wins; extraction failure evidence is preserved.
+        const metadata = {
+          ...extracted, source: source || "mcp", ...(extraMetadata || {}),
+          ...(extracted.extraction_failed ? {
+            extraction_failed: true, extraction_error: extracted.extraction_error,
+          } : {}),
+        };
 
         const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
           p_content: content,
@@ -557,6 +562,10 @@ function buildServer(): McpServer {
           confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
         if (Array.isArray(meta.action_items) && meta.action_items.length)
           confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+
+        if (extracted.extraction_failed) {
+          confirmation += `\nWarning: metadata extraction failed (${extracted.extraction_error}); the thought was saved with fallback metadata.`;
+        }
 
         return {
           content: [{ type: "text" as const, text: confirmation }],
@@ -668,7 +677,7 @@ app.options("*", (c) => {
 app.all("*", async (c) => {
   // Accept access key via header OR URL query parameter
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
+  if (!(await safeEqual(provided, MCP_ACCESS_KEY))) {
     // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
     // HTTP 401 so strict MCP hosts treat this as an application-level
     // error rather than a transport fault and keep the connection alive.
