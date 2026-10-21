@@ -31,6 +31,8 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
+import { safeEqual } from "./safe-equal.ts";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
@@ -255,7 +257,7 @@ app.all("*", async (c) => {
 
   const provided =
     c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
+  if (!(await safeEqual(provided, MCP_ACCESS_KEY))) {
     return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
   }
 

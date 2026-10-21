@@ -10,6 +10,8 @@ Deno.test("core census: auth, tool discovery, RPC arguments, results and errors"
   const oldEnv = envKeys.map((k) => Deno.env.get(k));
   let handler: (r: Request) => Response | Promise<Response>;
   let rpcCalls = 0;
+  let capturedMetadata: Record<string, unknown> | undefined;
+  let embeddingsSaved = 0;
   let responseMode = "ok";
   const calls: unknown[] = [];
   // Stop the real SDK's refresh timer on cleanup; keep leak sanitizers enabled.
@@ -29,7 +31,23 @@ Deno.test("core census: auth, tool discovery, RPC arguments, results and errors"
     for (const k of envKeys.slice(1)) Deno.env.set(k, "artificial-test-value");
     Deno.serve = ((fn: typeof handler) => { handler = fn; return {}; }) as typeof Deno.serve;
     globalThis.fetch = async (input, init) => {
-      assertEquals(String(input), "http://artificial.invalid/rest/v1/rpc/thought_census");
+      const url = String(input);
+      if (url === "https://openrouter.ai/api/v1/embeddings") {
+        return Response.json({ data: [{ embedding: [0.1, 0.2] }] });
+      }
+      if (url === "https://openrouter.ai/api/v1/chat/completions") {
+        return Response.json({ choices: [] });
+      }
+      if (url === "http://artificial.invalid/rest/v1/rpc/upsert_thought") {
+        capturedMetadata = JSON.parse(String(init?.body)).p_payload.metadata;
+        return Response.json({ id: "artificial-thought-id" });
+      }
+      if (url.startsWith("http://artificial.invalid/rest/v1/thoughts?")) {
+        assertEquals(init?.method, "PATCH");
+        embeddingsSaved++;
+        return new Response(null, { status: 204 });
+      }
+      assertEquals(url, "http://artificial.invalid/rest/v1/rpc/thought_census");
       rpcCalls++;
       calls.push(JSON.parse(String(init?.body)));
       if (responseMode === "error") return Response.json({ message: "Artificial RPC rejection", code: "22023" }, { status: 400 });
@@ -51,6 +69,14 @@ Deno.test("core census: auth, tool discovery, RPC arguments, results and errors"
     const denied = await rpc("tools/call", { name: "thought_census", arguments: { key: "sensitivity" } }, false);
     assertEquals(denied.error.code, -32001);
     assertEquals(rpcCalls, 0);
+    const captured = await rpc("tools/call", { name: "capture_thought", arguments: { content: "Artificial thought", metadata: { extraction_failed: false, extraction_error: "overridden" } } });
+    assertEquals(captured.result.isError, undefined);
+    assertEquals(capturedMetadata?.extraction_failed, true);
+    assertEquals(capturedMetadata?.extraction_error, "no choices");
+    assertEquals(capturedMetadata?.type, "observation");
+    assertEquals(embeddingsSaved, 1);
+    assert(captured.result.content[0].text.includes("id: artificial-thought-id"));
+    assertEquals(captured.result.content[0].text.split("\n")[1], "Warning: metadata extraction failed (no choices); the thought was saved with fallback metadata.");
     const list = await rpc("tools/list", {});
     const names = list.result.tools.map((t: { name: string }) => t.name);
     for (const name of ["search", "fetch", "search_thoughts", "list_thoughts", "thought_stats", "capture_thought", "thought_census"]) assert(names.includes(name));
