@@ -1,0 +1,20 @@
+{
+  "name": "Ingest Thought (Retired)",
+  "description": "Retired unauthenticated capture endpoint; returns HTTP 410 without accepting writes.",
+  "category": "integrations",
+  "author": {
+    "name": "OB1 maintainers",
+    "github": "NateBJones-Projects"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": false,
+    "services": [],
+    "tools": ["Deno"]
+  },
+  "tags": ["retired", "capture", "edge-function"],
+  "difficulty": "beginner",
+  "estimated_time": "1 minute",
+  "created": "2026-10-20",
+  "updated": "2026-10-21"
+}
