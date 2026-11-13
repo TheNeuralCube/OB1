@@ -13,6 +13,10 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 //   B5 extractMetadata  keeps the original vocabulary (type incl. decision/personal, `topic`
 //                       string, `tags`) for continuity with an existing corpus.
 //   B6 thought_census  counts metadata groups in SQL, including the missing-key bucket.
+//   B7 search_thoughts  OB_SEARCH_VERSION=v5 sends the same query text and embedding to
+//                       match_thoughts_v5 (hybrid search with a fixed exclusion inside the SQL).
+//                       Default and any other value = v4. Tool inputs and output are unchanged.
+//                       The ChatGPT-shape `search` tool always stays on v4.
 // Everything else (search/fetch, auth, transport, upsert_thought dedup) is upstream as-is.
 
 import { extractMetadata } from "./metadata.ts";
@@ -80,6 +84,12 @@ async function getEmbedding(text: string): Promise<number[]> {
   }
   const d = await r.json();
   return d.data[0].embedding;
+}
+
+// B7: which search RPC search_thoughts calls. Only the exact value "v5" selects v5;
+// unset, empty or anything else keeps v4 (flag-off rollback needs no data or schema change).
+function searchVersion(): "v4" | "v5" {
+  return (Deno.env.get("OB_SEARCH_VERSION") ?? "").trim().toLowerCase() === "v5" ? "v5" : "v4";
 }
 
 // B2/B3/B4 helper: a thought's topic labels, whichever form the row uses.
@@ -225,12 +235,20 @@ function buildServer(): McpServer {
     async ({ query, limit, count, threshold, filter }) => {
       try {
         const qEmb = await getEmbedding(query);
-        const { data, error } = await supabase.rpc("match_thoughts", {
-          query_embedding: qEmb,
-          match_threshold: threshold,
-          match_count: count ?? limit,
-          filter: filter ?? {},
-        });
+        const { data, error } = searchVersion() === "v5"
+          ? await supabase.rpc("match_thoughts_v5", {
+            query_text: query,
+            query_embedding: qEmb,
+            match_threshold: threshold,
+            match_count: count ?? limit,
+            filter: filter ?? {},
+          })
+          : await supabase.rpc("match_thoughts", {
+            query_embedding: qEmb,
+            match_threshold: threshold,
+            match_count: count ?? limit,
+            filter: filter ?? {},
+          });
 
         if (error) {
           return {
