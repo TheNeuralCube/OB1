@@ -1,0 +1,13 @@
+{
+  "name": "Hybrid Search v5 (match_thoughts_v5)",
+  "description": "Additive hybrid search for Open Brain: vector and full-text legs fused by reciprocal rank, bounded recency, and a fixed fail-closed exclusion inside the function. Flag-gated; the existing match_thoughts is not changed.",
+  "category": "schemas",
+  "author": { "name": "The Neural Cube", "github": "TheNeuralCube" },
+  "version": "0.1.0",
+  "requires": { "open_brain": true, "services": ["Supabase"], "tools": ["Deno (server tests)"] },
+  "tags": ["search", "hybrid", "full-text", "recency", "security"],
+  "difficulty": "advanced",
+  "estimated_time": "45 minutes",
+  "created": "2026-11-11",
+  "updated": "2026-11-11"
+}
