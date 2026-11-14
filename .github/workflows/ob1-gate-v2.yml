@@ -13,7 +13,7 @@ name: OB1 PR Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
-    branches: [main, 'feat/ob1-ci-policy']
+    branches: [main, 'feat/ob1-ci-policy', 'feat/ob1-hub-mods']
   workflow_dispatch:
 
 # Fork code is inspected only in the unprivileged PR event. Never opt into
