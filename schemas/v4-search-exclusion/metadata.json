@@ -1,0 +1,20 @@
+{
+  "name": "Fixed Exclusion for v4 Search",
+  "description": "Exclude malformed, restricted, and journal-marked metadata from v4 search before result ordering and limits, with synthetic SQL proof.",
+  "category": "schemas",
+  "author": {
+    "name": "The Neural Cube",
+    "github": "TheNeuralCube"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": ["PostgreSQL 17", "pgvector 0.8.0", "psql"]
+  },
+  "tags": ["search", "metadata", "privacy", "sql"],
+  "difficulty": "advanced",
+  "estimated_time": "30 minutes",
+  "created": "2026-11-13",
+  "updated": "2026-11-13"
+}
