@@ -1,0 +1,13 @@
+{
+  "name": "Guarded Thought Updates and Census",
+  "description": "Transactional old-row audit, sensitivity downgrade declarations, anon privilege revocation and SQL-backed metadata census for Open Brain.",
+  "category": "schemas",
+  "author": { "name": "The Neural Cube", "github": "TheNeuralCube" },
+  "version": "1.0.0",
+  "requires": { "open_brain": true, "services": ["Supabase"], "tools": [] },
+  "tags": ["audit", "metadata", "census", "security"],
+  "difficulty": "advanced",
+  "estimated_time": "45 minutes",
+  "created": "2026-09-13",
+  "updated": "2026-09-13"
+}
